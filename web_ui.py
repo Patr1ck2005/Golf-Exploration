@@ -90,6 +90,61 @@ def api_simulate():
     return jsonify(response)
 
 
+@app.route('/api/sweep', methods=['POST'])
+def api_sweep():
+    """Run a parameter sweep around current ball position."""
+    data = request.get_json()
+    if not data:
+        return jsonify({'error': 'No JSON data'}), 400
+
+    terrain_name = data.get('terrain', 'links_course')
+    start_x = float(data.get('start_x', 0.0))
+    start_y = data.get('start_y')
+    hole_x = float(data.get('hole_x', 200))
+    v0_min = float(data.get('v0_min', 5))
+    v0_max = float(data.get('v0_max', 70))
+    theta_min = float(data.get('theta_min', 2))
+    theta_max = float(data.get('theta_max', 80))
+    resolution = int(data.get('resolution', 30))
+    sweep_dt = float(data.get('dt', 0.03))
+    sweep_roll = bool(data.get('include_roll', False))
+
+    if start_y is not None:
+        start_y = float(start_y)
+
+    try:
+        terrain = get_preset(terrain_name)
+    except KeyError:
+        return jsonify({'error': f'Unknown terrain: {terrain_name}'}), 404
+
+    v0_vals = np.linspace(v0_min, v0_max, resolution).tolist()
+    theta_vals = np.linspace(theta_min, theta_max, resolution).tolist()
+    distance_grid = []
+    holed_grid = []
+
+    for v0 in v0_vals:
+        dist_row = []
+        holed_row = []
+        for th in theta_vals:
+            r = simulate_shot(v0, th, terrain, hole_x=hole_x,
+                              start_x=start_x, start_y=start_y,
+                              include_roll=sweep_roll, dt=sweep_dt,
+                              record_trajectory=False)
+            dist_row.append(float(r['hole_distance']) if r['hole_distance'] is not None else 0.0)
+            holed_row.append(bool(r['holed']))
+        distance_grid.append(dist_row)
+        holed_grid.append(holed_row)
+
+    return jsonify({
+        'v0_grid': v0_vals,
+        'theta_grid': theta_vals,
+        'distance_grid': distance_grid,
+        'holed_grid': holed_grid,
+        'start_x': start_x,
+        'hole_x': hole_x,
+    })
+
+
 # ---------------------------------------------------------------------------
 # HTML template (single page, embedded CSS + JS)
 # ---------------------------------------------------------------------------
@@ -161,6 +216,38 @@ body {
   font-size: 13px; white-space: nowrap;
 }
 .help { color: #b0bec5; font-size: 11px; white-space: nowrap; }
+#analyze-btn {
+  margin-left: auto; padding: 4px 12px; font-size: 12px;
+  background: #455a64; color: #fff; border: none; border-radius: 3px; cursor: pointer;
+}
+#analyze-btn:hover { background: #546e7a; }
+
+/* Modal */
+#modal-overlay {
+  display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+  background: rgba(0,0,0,0.5); z-index: 100;
+  justify-content: center; align-items: center;
+}
+#modal-overlay.active { display: flex; }
+#modal-panel {
+  background: #fff; border-radius: 6px; padding: 20px; width: 720px;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+}
+#modal-panel h3 { margin: 0 0 12px 0; font-size: 15px; color: #37474f; }
+.modal-row { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.modal-row label { font-size: 12px; color: #546e7a; min-width: 50px; }
+.modal-row input { width: 56px; padding: 3px 4px; font-size: 12px; border: 1px solid #cfd8dc; border-radius: 3px; }
+#sweep-canvas { border: 1px solid #e0e0e0; margin-top: 10px; display: block; }
+#sweep-status { font-size: 12px; color: #78909c; margin-left: 12px; }
+#run-sweep-btn {
+  padding: 6px 18px; font-size: 13px; background: #1e88e5; color: #fff;
+  border: none; border-radius: 4px; cursor: pointer;
+}
+#run-sweep-btn:hover { background: #1976d2; }
+#run-sweep-btn:disabled { background: #b0bec5; cursor: default; }
+#close-modal-btn {
+  float: right; background: none; border: none; font-size: 18px; cursor: pointer; color: #78909c;
+}
 </style>
 </head>
 <body>
@@ -186,6 +273,7 @@ body {
       <span class="hud-value" id="speed-val">1x</span>
     </div>
     <div class="help">Drag to aim · Space tee reset · Scroll zoom</div>
+    <button id="analyze-btn">Analyze</button>
   </div>
 
   <div id="canvas-wrap">
@@ -201,6 +289,29 @@ body {
       <div class="stat"><span class="stat-label">Status:</span><span class="stat-value" id="stat-status">Aiming</span></div>
     </div>
     <div id="message"></div>
+  </div>
+</div>
+
+<!-- Analysis Modal -->
+<div id="modal-overlay">
+  <div id="modal-panel">
+    <button id="close-modal-btn">&times;</button>
+    <h3>Shot Analysis — Hole Distance Heatmap</h3>
+    <div class="modal-row">
+      <label>v0 range</label>
+      <input id="sweep-v0-min" type="number" value="5" step="1"> –
+      <input id="sweep-v0-max" type="number" value="70" step="1"> m/s
+      <label style="margin-left:16px;">θ range</label>
+      <input id="sweep-th-min" type="number" value="2" step="1"> –
+      <input id="sweep-th-max" type="number" value="80" step="1"> deg
+      <label style="margin-left:16px;">Res</label>
+      <input id="sweep-res" type="number" value="30" step="5" min="10" max="80">
+    </div>
+    <div class="modal-row">
+      <button id="run-sweep-btn">Run Sweep</button>
+      <span id="sweep-status"></span>
+    </div>
+    <canvas id="sweep-canvas" width="680" height="400"></canvas>
   </div>
 </div>
 
@@ -883,6 +994,141 @@ function resetShot() {
 // ======================================================================
 // Startup
 // ======================================================================
+// ======================================================================
+// Analysis Modal
+// ======================================================================
+const modalOverlay = document.getElementById('modal-overlay');
+const sweepCanvas = document.getElementById('sweep-canvas');
+const sweepCtx = sweepCanvas.getContext('2d');
+
+document.getElementById('analyze-btn').addEventListener('click', () => {
+  // Pre-fill start position from current ball position
+  document.getElementById('sweep-v0-min').value = 5;
+  document.getElementById('sweep-v0-max').value = 70;
+  document.getElementById('sweep-th-min').value = 2;
+  document.getElementById('sweep-th-max').value = 80;
+  document.getElementById('sweep-res').value = 40;
+  document.getElementById('sweep-status').textContent = '';
+  sweepCtx.clearRect(0, 0, sweepCanvas.width, sweepCanvas.height);
+  modalOverlay.classList.add('active');
+});
+
+document.getElementById('close-modal-btn').addEventListener('click', () => {
+  modalOverlay.classList.remove('active');
+});
+modalOverlay.addEventListener('click', (e) => {
+  if (e.target === modalOverlay) modalOverlay.classList.remove('active');
+});
+
+document.getElementById('run-sweep-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('run-sweep-btn');
+  const status = document.getElementById('sweep-status');
+  btn.disabled = true;
+  status.textContent = 'Running sweep...';
+
+  const v0Min = parseFloat(document.getElementById('sweep-v0-min').value);
+  const v0Max = parseFloat(document.getElementById('sweep-v0-max').value);
+  const thMin = parseFloat(document.getElementById('sweep-th-min').value);
+  const thMax = parseFloat(document.getElementById('sweep-th-max').value);
+  const res = parseInt(document.getElementById('sweep-res').value);
+
+  const resp = await fetch('/api/sweep', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      terrain: state.terrainName,
+      start_x: state.ballX,
+      start_y: state.ballY,
+      hole_x: state.holeX,
+      v0_min: v0Min, v0_max: v0Max,
+      theta_min: thMin, theta_max: thMax,
+      resolution: res,
+    }),
+  });
+  const data = await resp.json();
+
+  // Render heatmap
+  const W = sweepCanvas.width, H = sweepCanvas.height;
+  sweepCtx.clearRect(0, 0, W, H);
+
+  const v0Vals = data.v0_grid;
+  const thVals = data.theta_grid;
+  const distGrid = data.distance_grid;
+  const holedGrid = data.holed_grid;
+
+  const nV = v0Vals.length, nT = thVals.length;
+
+  // Layout margins
+  const left = 55, right = 40, top = 25, bottom = 30;
+  const gridW = W - left - right;
+  const gridH = H - top - bottom;
+  const cellW = gridW / nT;
+  const cellH = gridH / nV;
+
+  // Find max distance for color scale
+  let maxDist = 0;
+  for (let i = 0; i < nV; i++)
+    for (let j = 0; j < nT; j++)
+      if (distGrid[i][j] > maxDist) maxDist = distGrid[i][j];
+
+  // Draw cells
+  for (let i = 0; i < nV; i++) {
+    for (let j = 0; j < nT; j++) {
+      const d = distGrid[i][j];
+      if (holedGrid[i][j]) {
+        sweepCtx.fillStyle = '#000';
+      } else {
+        const t = maxDist > 0 ? Math.min(1, d / maxDist) : 0;
+        const r = Math.floor(255 * t);
+        const g = Math.floor(255 * (1 - t));
+        sweepCtx.fillStyle = `rgb(${r},${g},0)`;
+      }
+      sweepCtx.fillRect(left + j * cellW, top + i * cellH, cellW, cellH);
+    }
+  }
+
+  // Axis labels
+  sweepCtx.fillStyle = '#333';
+  sweepCtx.font = '11px sans-serif';
+  sweepCtx.textAlign = 'center';
+  sweepCtx.fillText('θ (deg)', left + gridW / 2, H - 4);
+  sweepCtx.save();
+  sweepCtx.translate(10, top + gridH / 2);
+  sweepCtx.rotate(-Math.PI / 2);
+  sweepCtx.fillText('v₀ (m/s)', 0, 0);
+  sweepCtx.restore();
+
+  // Tick labels
+  sweepCtx.textAlign = 'center';
+  sweepCtx.font = '10px sans-serif';
+  sweepCtx.fillText(thVals[0].toFixed(0), left, H - 12);
+  sweepCtx.fillText(thVals[nT-1].toFixed(0), left + gridW, H - 12);
+  sweepCtx.textAlign = 'right';
+  sweepCtx.fillText(v0Vals[0].toFixed(0), left - 4, top + 12);
+  sweepCtx.fillText(v0Vals[nV-1].toFixed(0), left - 4, top + gridH);
+
+  // Color bar (right side, vertically centered in grid)
+  const cbX = left + gridW + 10;
+  const cbY = top;
+  const cbW = 10;
+  const cbH = gridH;
+  for (let i = 0; i < cbH; i++) {
+    const t = 1 - i / (cbH - 1);
+    const r = Math.floor(255 * t);
+    const g = Math.floor(255 * (1 - t));
+    sweepCtx.fillStyle = `rgb(${r},${g},0)`;
+    sweepCtx.fillRect(cbX, cbY + i, cbW, 1);
+  }
+  sweepCtx.fillStyle = '#333';
+  sweepCtx.font = '9px sans-serif';
+  sweepCtx.textAlign = 'left';
+  sweepCtx.fillText(maxDist.toFixed(0) + 'm', cbX + cbW + 2, cbY + 10);
+  sweepCtx.fillText('0', cbX + cbW + 2, cbY + cbH);
+
+  status.textContent = `Done. ${nV}×${nT} = ${nV*nT} shots. Black = holed.`;
+  btn.disabled = false;
+});
+
 async function init() {
   // Read URL query parameters: ?terrain=links_course&hole=180
   const params = new URLSearchParams(window.location.search);
